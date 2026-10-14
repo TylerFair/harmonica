@@ -94,3 +94,29 @@ harmonica.jax
 
     :return: Normalised transit light curve fluxes [].
     :rtype: array
+
+harmonica.jax.native
+~~~~~~~~~~~~~~~~~~~~
+
+.. currentmodule:: harmonica.jax.native
+
+Pure-jax implementations of the same light curves, compiled by XLA without
+a custom call. These run on any jax backend, including GPUs, and support
+jit, vmap, and forward- and reverse-mode autodiff. Every parameter may be a
+scalar or an array broadcast against the times, and r may have shape
+times.shape + (N,). The final two transmission string coefficients may
+both be zero. Planet-limb integrals use Gauss-Legendre quadrature of
+order n_legendre (default 50).
+
+.. function:: harmonica_transit_quad_ld(times, t0, period, a, inc, ecc=0., omega=0., u1=0., u2=0., r=jnp.array([0.1]), n_legendre=50)
+
+    Harmonica transits in pure jax -- quadratic limb darkening.
+
+.. function:: harmonica_transit_nonlinear_ld(times, t0, period, a, inc, ecc=0., omega=0., u1=0., u2=0., u3=0., u4=0., r=jnp.array([0.1]), n_legendre=50)
+
+    Harmonica transits in pure jax -- non-linear limb darkening.
+
+.. function:: harmonica_transit_power2_ld(times, t0, period, a, inc, ecc=0., omega=0., c=0., alpha=1., r=jnp.array([0.1]), n_legendre=50)
+
+    Harmonica transits in pure jax -- power-2 limb darkening,
+    I(mu) = 1 - c (1 - mu^alpha).

@@ -44,3 +44,6 @@ jobs:
 
       - name: Test flux derivatives
         run: python tests/test_flux_derivatives.py
+
+      - name: Test pure-jax light curves
+        run: python tests/test_jax_native.py
