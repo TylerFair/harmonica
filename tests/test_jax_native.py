@@ -80,31 +80,46 @@ class TestJaxNative(unittest.TestCase):
             self.assertLess(np.max(np.abs(fs_p2 - fs_quad)), 1.e-14)
 
     def test_gradients(self):
-        """ Test autodiff gradients against finite differences. """
-        for n_c in range(3):
-            rs = self._random_string(n_c)
-            params = jnp.concatenate([jnp.array(
-                [self.t0, self.period, self.a, self.inc, 0.1, 0.5,
-                 *self.quad_ld]), jnp.asarray(rs)])
+        """ Test autodiff gradients against the C++ analytic derivatives.
 
-            @jax.jit
-            def flux(p):
-                return native.harmonica_transit_quad_ld(
-                    self.times, *p[:8], r=p[8:])
+        Finite differences are unreliable here: near contact the flux's
+        second derivative diverges, so their error does not bound ours.
+        """
+        from harmonica.jax import custom_primitives
+        for limb_dark_law, us in zip(['quadratic', 'non-linear'],
+                                     [self.quad_ld, self.nl_ld]):
+            if limb_dark_law == 'quadratic':
+                fn = native.harmonica_transit_quad_ld
+                prim = custom_primitives.jax_light_curve_quad_ld_prim
+            else:
+                fn = native.harmonica_transit_nonlinear_ld
+                prim = custom_primitives.jax_light_curve_nonlinear_ld_prim
+            n_ld = len(us)
+            for n_c in range(4):
+                rs = self._random_string(n_c)
+                params = jnp.concatenate([jnp.array(
+                    [self.t0, self.period, self.a, self.inc, 0.1, 0.5, *us]),
+                    jnp.asarray(rs)])
 
-            jac = np.asarray(jax.jit(jax.jacfwd(flux))(params))
-            self.assertTrue(np.all(np.isfinite(jac)))
+                @jax.jit
+                def flux(p):
+                    return fn(self.times, *p[:6 + n_ld], r=p[6 + n_ld:])
 
-            # Reverse mode agrees with forward mode.
-            grad = np.asarray(jax.grad(lambda p: jnp.sum(flux(p)))(params))
-            np.testing.assert_allclose(grad, jac.sum(axis=0), rtol=1.e-9,
-                                       atol=1.e-12)
+                jac = np.asarray(jax.jit(jax.jacfwd(flux))(params))
+                self.assertTrue(np.all(np.isfinite(jac)))
+                # The C++ custom call only runs on a CPU.
+                with jax.default_device(jax.devices('cpu')[0]):
+                    _, jac_cpp = prim(self.times, *np.asarray(params))
+                # The C++ derivatives of circles with respect to r0 are
+                # only accurate to ~2e-6 just inside contact, as checked
+                # against converged finite differences.
+                self.assertLess(np.max(np.abs(jac - jac_cpp)), 1.e-5)
 
-            for i in range(params.shape[0]):
-                h = 1.e-6 * max(1., abs(float(params[i])))
-                fd = (flux(params.at[i].add(h))
-                      - flux(params.at[i].add(-h))) / (2. * h)
-                self.assertLess(np.max(np.abs(jac[:, i] - fd)), 1.e-5)
+                # Reverse mode agrees with forward mode.
+                grad = np.asarray(jax.grad(
+                    lambda p: jnp.sum(flux(p)))(params))
+                np.testing.assert_allclose(grad, jac.sum(axis=0),
+                                           rtol=1.e-9, atol=1.e-12)
 
     def test_eccentricity_gradient_at_zero(self):
         """ Test d flux / d ecc at ecc=0 matches a one-sided difference. """
@@ -143,6 +158,35 @@ class TestJaxNative(unittest.TestCase):
             times, self.t0, self.period, self.a, self.inc,
             u1=0.1, u2=0.5, r=self._random_string(2))
         np.testing.assert_array_equal(fs, np.ones(4))
+
+    def test_dispatch(self):
+        """ Test harmonica.jax uses the C++ on CPUs and pure jax elsewhere. """
+        from harmonica.jax import harmonica_transit_quad_ld
+        rs = jnp.asarray(self._random_string(2))
+
+        def flux(r):
+            return harmonica_transit_quad_ld(
+                self.times, self.t0, self.period, self.a, self.inc, 0.1,
+                0.2, *self.quad_ld, r=r)
+
+        fs_native = self._jax(0.1, 0.2, self.quad_ld, rs, 'quadratic')
+        if jax.default_backend() == 'cpu':
+            ht = HarmonicaTransit(times=self.times)
+            ht.set_orbit(self.t0, self.period, self.a, self.inc, 0.1, 0.2)
+            ht.set_stellar_limb_darkening(self.quad_ld)
+            ht.set_planet_transmission_string(np.asarray(rs))
+            np.testing.assert_array_equal(jax.jit(flux)(rs),
+                                          ht.get_transit_light_curve())
+        else:
+            np.testing.assert_allclose(jax.jit(flux)(rs), fs_native,
+                                       rtol=0., atol=1.e-14)
+
+        # Derivatives agree between the two implementations.
+        jac = jax.jit(jax.jacfwd(flux))(rs)
+        jac_native = jax.jacfwd(lambda r: native.harmonica_transit_quad_ld(
+            self.times, self.t0, self.period, self.a, self.inc, 0.1, 0.2,
+            *self.quad_ld, r=r))(rs)
+        self.assertLess(np.max(np.abs(jac - jac_native)), 1.e-6)
 
     def test_batching(self):
         """ Test per-time parameters, nd times, jit and vmap. """

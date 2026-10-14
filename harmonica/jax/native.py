@@ -22,6 +22,7 @@ three numerical choices suited to fixed-shape XLA programs:
   to the maximum possible number of intersections.
 """
 import math
+from functools import partial
 
 import numpy as np
 import jax
@@ -139,17 +140,31 @@ def harmonica_transit_power2_ld(times, t0, period, a, inc, ecc=0., omega=0.,
 
 
 def _light_curve(law, times, orbit_params, ld_params, r, n_legendre):
-    """ Broadcast inputs, solve the orbit, and evaluate each flux. """
-    times = jnp.asarray(times, dtype=jnp.float64)
+    """ Check inputs and evaluate the compiled light curve. """
     r = jnp.asarray(r, dtype=jnp.float64)
     if r.ndim == 0 or r.shape[-1] % 2 != 1:
         raise ValueError('The transmission string r must have an odd length.')
+    # A constant zero eccentricity skips Kepler's equation entirely. A
+    # traced one always takes the eccentric branch, so that derivatives
+    # with respect to ecc remain correct at ecc = 0.
+    ecc = orbit_params[4]
+    circular_only = (not isinstance(ecc, jax.core.Tracer)
+                     and bool(np.all(np.asarray(ecc) == 0.)))
+    return _compiled_light_curve(law, circular_only, int(n_legendre), times,
+                                 tuple(orbit_params), tuple(ld_params), r)
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2))
+def _compiled_light_curve(law, circular_only, n_legendre, times,
+                          orbit_params, ld_params, r):
+    """ Broadcast inputs, solve the orbit, and evaluate each flux. """
+    times = jnp.asarray(times, dtype=jnp.float64)
     orbit_params = [jnp.asarray(p, dtype=jnp.float64) for p in orbit_params]
     ld_params = [jnp.asarray(u, dtype=jnp.float64) for u in ld_params]
     shape = jnp.broadcast_shapes(times.shape, r.shape[:-1],
                                  *(p.shape for p in orbit_params + ld_params))
     d, z, nu = (jnp.broadcast_to(x, shape).ravel()
-                for x in _orbit(times, *orbit_params))
+                for x in _orbit(times, *orbit_params, circular_only))
 
     # Map over per-time parameters only; shared ones stay unbatched.
     def batched(x, core=()):
@@ -170,17 +185,13 @@ def _light_curve(law, times, orbit_params, ld_params, r, n_legendre):
 # ============================================================
 # Orbit.
 # ============================================================
-def _orbit(time, t0, period, a, inc, ecc, omega):
+def _orbit(time, t0, period, a, inc, ecc, omega, circular_only):
     """ Sky-projected separation d, line-of-sight z, and angle nu.
 
     Matches harmonica/orbit/trajectories.cpp, including the psi
     rotation which aligns the transmission string with the orbit.
+    circular_only skips Kepler's equation, for a constant ecc = 0.
     """
-    # A constant zero eccentricity skips Kepler's equation entirely. A
-    # traced one always takes the eccentric branch, so that derivatives
-    # with respect to ecc remain correct at ecc = 0.
-    circular_only = (not isinstance(ecc, jax.core.Tracer)
-                     and bool(np.all(np.asarray(ecc) == 0.)))
     time, t0, period, a, inc, ecc, omega = jnp.broadcast_arrays(
         time, t0, period, a, inc, ecc, omega)
     n = _TWOPI / period

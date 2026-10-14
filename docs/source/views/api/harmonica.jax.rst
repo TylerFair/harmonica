@@ -108,6 +108,14 @@ times.shape + (N,). The final two transmission string coefficients may
 both be zero. Planet-limb integrals use Gauss-Legendre quadrature of
 order n_legendre (default 50).
 
+harmonica_transit_quad_ld and harmonica_transit_nonlinear_ld in
+harmonica.jax choose an implementation for you: the C++ model on CPUs,
+where it is fastest, and these pure-jax versions on other platforms. Each
+point does a fixed amount of work here, padded to the most complex
+geometry, which suits GPUs but is around ten times slower than the C++ on
+a CPU. Inputs the C++ does not accept, such as per-time parameters, always
+use the pure-jax versions.
+
 .. function:: harmonica_transit_quad_ld(times, t0, period, a, inc, ecc=0., omega=0., u1=0., u2=0., r=jnp.array([0.1]), n_legendre=50)
 
     Harmonica transits in pure jax -- quadratic limb darkening.
@@ -119,4 +127,5 @@ order n_legendre (default 50).
 .. function:: harmonica_transit_power2_ld(times, t0, period, a, inc, ecc=0., omega=0., c=0., alpha=1., r=jnp.array([0.1]), n_legendre=50)
 
     Harmonica transits in pure jax -- power-2 limb darkening,
-    I(mu) = 1 - c (1 - mu^alpha).
+    I(mu) = 1 - c (1 - mu^alpha). Also available as
+    harmonica.jax.harmonica_transit_power2_ld.
