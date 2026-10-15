@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from functools import partial
 
 from harmonica import bindings
+from harmonica.jax import native
 
 # Enable double floating precision.
 jax.config.update("jax_enable_x64", True)
@@ -118,7 +119,53 @@ def _light_curve(target, times, params, r):
         # be silently truncated. Use jax.vmap to batch over parameters.
         raise ValueError('Orbital and limb-darkening parameters must be '
                          'scalars; use jax.vmap to evaluate many.')
-    return _primitive(target, times, *params, *r)[0]
+    return _flux(target, times, jnp.concatenate([jnp.stack(params), r]))
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _flux(target, times, p):
+    """ C++ fluxes, as a function of the parameter vector p. """
+    return _primitive(target, times, *p)[0]
+
+
+@_flux.defjvp
+def _flux_jvp(target, primals, tangents):
+    """ First derivatives from the C++.
+
+    The flux depends on time only through t - t0, so its time derivative
+    is minus the t0 derivative.
+    """
+    times, p = primals
+    times_dot, p_dot = tangents
+    jac = _jacobian(target, times, p)
+    return (_flux(target, times, p),
+            jac @ p_dot - jac[..., 0] * times_dot)
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _jacobian(target, times, p):
+    """ C++ derivatives of the fluxes with respect to p. """
+    return _primitive(target, times, *p)[1]
+
+
+@_jacobian.defjvp
+def _jacobian_jvp(target, primals, tangents):
+    """ Second derivatives from the pure-jax model.
+
+    The C++ computes first derivatives only. This rule is only traced for
+    second and higher derivatives, so first derivatives keep the C++'s
+    speed. Its own derivatives are those of the pure-jax model.
+    """
+    times, p = primals
+    times_dot, p_dot = tangents
+    n_ld = 2 if target == "jax_light_curve_quad_ld" else 4
+    model = (native.harmonica_transit_quad_ld if n_ld == 2
+             else native.harmonica_transit_nonlinear_ld)
+    _, jac_dot = jax.jvp(
+        jax.jacfwd(lambda t, q: model(t, *q[:6 + n_ld], r=q[6 + n_ld:]),
+                   argnums=1),
+        (times, p), (times_dot, p_dot))
+    return _jacobian(target, times, p), jac_dot
 
 
 def jax_light_curve_quad_ld_prim(times, *params):
