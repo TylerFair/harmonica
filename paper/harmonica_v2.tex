@@ -25,23 +25,23 @@ silhouette is a Fourier series in angle, a ``transmission string''. Its
 C++ core finds the planet--star limb intersections from the eigenvalues
 of a companion matrix and integrates the occulted intensity with Green's
 theorem, branching on the geometry of each point. That structure is fast
-on one CPU core but maps poorly onto GPUs. We describe a reformulation in
-which every light-curve point performs the same, statically shaped work,
-so that the model compiles with XLA, runs on GPUs, batches over many
+on one CPU core but maps poorly onto GPUs. Here I present a reformulation
+in which every light-curve point performs the same, statically shaped
+work, so that the model compiles with XLA, runs on GPUs, batches over many
 light curves, and composes with automatic differentiation, including to
-higher order. Intersections are bracketed on angular grids, with a closed
+higher order. I bracket the intersections on angular grids, with a closed
 form for circles and a proven two-extremum bracket for first-order
-strings, and their derivatives follow from the implicit-function theorem.
-The occulted region is assembled from the direction in which the limbs
-cross, which we show handles tangencies and stellar arcs that wrap around
-the star. Validated against independent brute-force overlap areas and
-analytic cases, the model agrees with the C++ to ${\sim}10^{-10}$ at the
+strings, and take their derivatives from the implicit-function theorem. I
+then assemble the occulted region from the direction in which the limbs
+cross, which I show handles tangencies and stellar arcs that wrap around
+the star. Against independent brute-force overlap areas and analytic
+cases, the new model agrees with the C++ to ${\sim}10^{-10}$ at the
 default quadrature order and to ${\sim}4\times10^{-15}$ at matched order,
-where the C++ is itself correct. Validation also uncovered several errors
-in the original implementation, including fluxes above unity for planets
-that cover the stellar centre and a flattened orbit near apastron. A
-dispatch layer evaluates the C++ on CPUs, with correct higher
-derivatives, and the new model elsewhere.
+wherever the C++ is itself correct. Critically, this validation also
+uncovered several errors in the original implementation, including fluxes
+above unity for planets that cover the stellar centre and a flattened
+orbit near apastron. A dispatch layer runs the C++ on CPUs, now with
+correct higher derivatives, and the new model everywhere else.
 \end{abstract}
 
 \keywords{Exoplanet atmospheres (487) --- Transits (1711) ---
@@ -68,14 +68,14 @@ ensemble samplers. GPUs suit this workload, but only for programs whose
 control flow and array shapes do not depend on the data. The original
 \harmonica\ evaluates each point with a data-dependent sequence of
 branches, an eigenvalue problem whose number of real roots varies, and a
-quadrature order that switches with position. Wrapping it for a GPU would
-therefore not help: the algorithm itself must change. This Letter
-describes those changes, released on the \texttt{jax-gpu} branch of
-\harmonica.\footnote{\url{https://github.com/TylerFair/harmonica/tree/jax-gpu}}
+quadrature order that switches with position. Simply wrapping it for a GPU
+therefore would not help: the algorithm itself has to change. In what
+follows I describe those changes, which I release on the
+\texttt{jax-gpu} branch of \harmonica.\footnote{\url{https://github.com/TylerFair/harmonica/tree/jax-gpu}}
 
 \section{The model} \label{sec:model}
 
-We follow the formulation of \citet{grant2023}. For limb-darkening laws
+I follow the formulation of \citet{grant2023}. For limb-darkening laws
 that are sums of powers of $\mu$, $I(\mu) = \sum_n p_n \mu^n$, the
 normalised flux is
 \begin{equation}
@@ -107,7 +107,7 @@ the arc's angular extent about the stellar centre.
 The quadratic law has $p = (1-u_1-u_2,\, u_1+2u_2,\, -u_2)$ for
 $\mu^{0,1,2}$ and $I_0^{-1} = \pi(1 - u_1/3 - u_2/6)$. The non-linear law
 has $p = (1-\sum_i u_i,\, u_1, u_2, u_3, u_4)$ for $\mu^{0,1/2,1,3/2,2}$
-and $I_0^{-1} = \pi(1 - u_1/5 - u_2/3 - 3u_3/7 - u_4/2)$. We add the
+and $I_0^{-1} = \pi(1 - u_1/5 - u_2/3 - 3u_3/7 - u_4/2)$. I also add the
 power-2 law $I = 1 - c(1-\mu^\alpha)$ \citep{hestroffer1997, maxted2018},
 with $p=(1-c,\, c)$ for $\mu^{0,\alpha}$ and
 $I_0^{-1} = \pi[1 - c + 2c/(\alpha+2)]$. With $\alpha=2$ it reduces
@@ -127,7 +127,7 @@ with $f<0$ inside the star. Since $r_\mathrm{p}$ is a trigonometric
 polynomial of degree $N_c$, $f$ is one of degree $D = \max(2N_c, N_c+1)$,
 and has at most $2D$ real roots on the circle. The C++ finds them as
 eigenvalues of a $2D\times2D$ companion matrix, which requires $a_{N_c}$
-and $b_{N_c}$ not both to vanish. Instead we use three bracketing schemes,
+and $b_{N_c}$ not both to vanish. Instead, I use three bracketing schemes,
 each followed by bisection.
 
 \textit{Circles.} When every $a_n, b_n$ ($n\geq1$) is zero, the roots are
@@ -163,26 +163,26 @@ and similarly with the signs exchanged at $\phi+\pi/2$ and $\phi+3\pi/2$,
 so each arc contains exactly one zero. $\square$
 
 When the condition holds, which it does for any physically small
-asymmetry, both extrema are bisected on these certified brackets. Roots
-exist if and only if $f$ is positive at the maximum and negative at the
-minimum, and one lies on each arc between them, on which $f$ is monotone.
-This finds a pair of intersections arbitrarily close to contact, which a
-fixed angular grid can miss entirely.
+asymmetry, I bisect both extrema on these certified brackets. Roots exist
+if and only if $f$ is positive at the maximum and negative at the minimum,
+and one lies on each arc between them, on which $f$ is monotone. This
+finds a pair of intersections arbitrarily close to contact, which a fixed
+angular grid can miss entirely.
 
-\textit{General strings.} Otherwise, including uncertified $N_c=1$
-shapes, we evaluate $f$ and $f'$ on a uniform grid of
-$G=\max(128, 64N_c)$ intervals of width $h=2\pi/G$, bisect every sign
-change of $f'$, and insert the resulting extrema into the grid. Sign
-changes of $f$ between consecutive nodes then bracket the roots. The
-nodes form a closed loop. A node at which $f$ is exactly zero takes the
-sign of the preceding node, so that a crossing on a node is counted once
-and a tangency, which does not change sign, is not counted at all. A
-closed curve then crosses an even number of times, at most $2D$; any
-other count means the bracketing failed, and the flux is returned as NaN
-rather than as a plausible but wrong value.
+\textit{General strings.} Otherwise, including for uncertified $N_c=1$
+shapes, I evaluate $f$ and $f'$ on a uniform grid of $G=\max(128, 64N_c)$
+intervals of width $h=2\pi/G$, bisect every sign change of $f'$, and
+insert the resulting extrema into the grid. Sign changes of $f$ between
+consecutive nodes then bracket the roots. Because the nodes form a closed
+loop, I give any node at which $f$ is exactly zero the sign of the
+preceding node, so that a crossing on a node counts once and a tangency,
+which does not change sign, does not count at all. A closed curve then
+crosses an even number of times, at most $2D$. Any other count means the
+bracketing failed, and the model returns NaN rather than a plausible but
+wrong flux.
 
-This scheme is not certified. It finds every transverse root if each grid
-interval contains at most one zero of $f'$, e.g.\ if distinct zeros of
+This scheme is not certified, however. It finds every transverse root if
+each grid interval contains at most one zero of $f'$, e.g.\ if distinct zeros of
 $f'$ are separated by more than $h$. If $|f'''|\leq L$ and
 $|f''|\geq m>0$ at every critical point, Taylor's theorem gives a
 separation of at least $2m/L$, so $h < 2m/L$ suffices. A computable
@@ -191,13 +191,13 @@ either $|f''(c)| > Lq$, so that $f'$ is monotone on the cell, or
 $|f'(c)| > |f''(c)|\,q + Lq^2/2$, so that it has no zero there. Writing
 $A_n = (a_n^2+b_n^2)^{1/2}$, $R_0 = |a_0| + \sum_n A_n$ and
 $R_j = \sum_n n^j A_n$, a conservative bound is
-$L = 6R_1R_2 + 2R_0R_3 + 2|d|(R_3+3R_2+3R_1+R_0)$. A cell failing both
-tests is uncertified, not necessarily wrong.
+$L = 6R_1R_2 + 2R_0R_3 + 2|d|(R_3+3R_2+3R_1+R_0)$. A cell that fails
+both tests is uncertified, not necessarily wrong.
 
 \subsection{Root derivatives} \label{sec:jvp}
 
-Differentiating through bisection gives derivatives of zero. Instead, the
-root finder is given a custom derivative rule from the implicit-function
+Differentiating through bisection gives derivatives of zero, so I instead
+give the root finder a custom derivative rule from the implicit-function
 theorem, $\dot\theta_j = -\dot f/f_\theta$, with
 \begin{align}
 f_\theta &= 2 r_\mathrm{p} r_\mathrm{p}'
@@ -209,18 +209,18 @@ f_\theta &= 2 r_\mathrm{p} r_\mathrm{p}'
 with $C = \cos(\theta-\nu)$ and $S = \sin(\theta-\nu)$, and
 $\dot r_\mathrm{p}$ is Equation~\eqref{eq:string} evaluated with the
 coefficient tangents. Padded roots, and roots with
-$|f_\theta| < 10^{-14}$, receive zero tangents. The denominator is made
+$|f_\theta| < 10^{-14}$, receive zero tangents. I make the denominator
 safe \emph{before} dividing, since masking a $0/0$ afterwards still leaks
-NaN into reverse-mode derivatives. Everything downstream of the roots is
-differentiated automatically.
+NaN into reverse-mode derivatives. \jax\ then differentiates everything
+downstream of the roots automatically.
 
 \subsection{Assembling the occulted region} \label{sec:assembly}
 
 The C++ classifies each pair of consecutive crossings with a lookup table
 of crossing types, and integrates the stellar arc between them using the
-principal difference of their stellar angles. We found that this
-mis-assembles some configurations (Section~\ref{sec:issues}), and instead
-build the boundary from the direction in which the limbs cross.
+principal difference of their stellar angles. As I show in
+Section~\ref{sec:issues}, this mis-assembles some configurations, so I
+instead build the boundary from the direction in which the limbs cross.
 
 \textit{Planet arcs.} Order the crossings by $\theta$. Since $f<0$
 inside the star, the planet-limb arc after a crossing bounds the occulted
@@ -239,32 +239,31 @@ $1-d^2 = r_\mathrm{p}^2-2d\,r_\mathrm{p}\cos(\theta-\nu)$, from which
 $H_\phi = f_\theta$. $H$ cannot change sign before the next transverse
 crossing, and tangencies omitted from the root list do not change it.
 
-This requires positive radii and a complete list of transverse
-crossings, but no midpoint tests, crossing-type tolerances or angle
-wrapping heuristics. Every point evaluates $K=2D$ potential arcs of each
-kind, masked by these conditions, and masked arcs are given benign
+This construction needs positive radii and a complete list of transverse
+crossings, but no midpoint tests, crossing-type tolerances or
+angle-wrapping heuristics. Every point evaluates $K=2D$ potential arcs of
+each kind, masked by these conditions, and I give masked arcs benign
 geometry so that they cannot produce non-finite derivatives.
 
-Configurations without crossings are resolved in a fixed order. Bounds
+I resolve configurations without crossings in a fixed order. Bounds
 $r_\mathrm{p}\in[a_0 - \sum_n A_n,\, a_0 + \sum_n A_n]$, with a $10^{-12}$
 tolerance, identify planets wholly inside or outside the star and stars
 wholly inside the planet; they are exact for $N_c\leq1$ and conservative
 otherwise. Such a trivial classification overrides any roots and
-integrates the entire limb, since otherwise a root pair within the
-tolerance of contact would be integrated over only its tiny connecting
-arc. With no roots otherwise, the limb point facing the stellar centre,
+integrates the entire limb; otherwise, a root pair within the tolerance of
+contact would integrate over only its tiny connecting arc. With no roots otherwise, the limb point facing the stellar centre,
 $r_\mathrm{p}(\nu)$, decides between the remaining cases.
 
 \subsection{Line integrals} \label{sec:quadrature}
 
 The C++ evaluates $s_0$ and $s_2$ in closed form and the other terms by
-Gauss--Legendre quadrature, of order 20 or 50 depending on position. We
+Gauss--Legendre quadrature, of order 20 or 50 depending on position. I
 apply a single order $n_\mathrm{GL}$ (default 50) to every planet-limb
 term, which removes the position-dependent branch and is at least as
 accurate as the C++ default (Table~\ref{tab:accuracy}).
 
 Equation~\eqref{eq:zeta} has a removable singularity at $z=1$, the
-stellar disc centre, and cancels catastrophically near it. We use exact
+stellar disc centre, and cancels catastrophically near it. I use exact
 rearrangements that avoid both:
 \begin{align}
 \zeta_0 &= \tfrac{1}{2}, \qquad
@@ -274,7 +273,7 @@ rearrangements that avoid both:
 \zeta_{3/2} &= \frac{2}{7}\,\frac{\sum_{k=0}^{6} s^k}{(1+s)(1+s^2)},
 \end{align}
 where $s = z^{1/2}$. For the power-2 term, with $t = 1-z^2$ and
-$p=(\alpha+2)/2$, we sum twelve terms of the Taylor series of
+$p=(\alpha+2)/2$, I sum twelve terms of the Taylor series of
 $[1-(1-t)^p]/(2pt)$ when $t < \min(0.01, 0.1/p)$, which keeps its
 truncation error below ${\sim}10^{-21}$ for any $\alpha$; evaluate
 \begin{equation}
@@ -282,28 +281,29 @@ truncation error below ${\sim}10^{-21}$ for any $\alpha$; evaluate
 \operatorname{log1p}(-t)\right]}{2pt}
 \end{equation}
 for larger $t < 1/2$; and use Equation~\eqref{eq:zeta} directly beyond.
-Values and first and second derivatives were checked against a 75-digit
-reference for $\alpha$ up to 100, with errors below $3\times10^{-12}$;
-no finite series supplies correct derivatives of arbitrarily high order.
+Against a 75-digit reference for $\alpha$ up to 100, the values and first
+and second derivatives all agree to better than $3\times10^{-12}$. No
+finite series, of course, supplies correct derivatives of arbitrarily
+high order.
 
 \subsection{Orbits} \label{sec:orbit}
 
 The orbit follows the C++, including its rotation of the string with the
-orbit, but with three changes. Kepler's equation is solved on $[0,\pi]$ by
-Newton iterations safeguarded by bisection, on
+orbit, but with three changes. First, I solve Kepler's equation on
+$[0,\pi]$ by Newton iterations safeguarded by bisection, on
 $(1-e)E + e(E-\sin E) = M$ with a series for $E-\sin E$ near zero, so that
-it does not cancel as $e\to1$; its derivatives are given by the
-implicit-function theorem. The true anomaly and radius then follow from
+it does not cancel as $e\to1$, and take its derivatives from the
+implicit-function theorem. Second, the true anomaly and radius follow from
 $s=\sin(E/2)$, as $\cos f = [(1-e)-2s^2]/[(1-e)+2e s^2]$,
 $\sin f = \sqrt{(1-e)(1+e)}\,\sin E/[(1-e)+2es^2]$ and
 $r=a[(1-e)+2es^2]$, which avoid both cancellation near $e=1$ and the
 singular half-angle formula, $\tan(f/2) \propto \tan(E/2)$, near apastron.
-Finally, the eccentric anomaly at transit is
+Third, the eccentric anomaly at transit is
 $E_0 = \operatorname{atan2}(\sqrt{(1-e)(1+e)}\cos\omega,\, e + \sin\omega)$,
 whose derivatives are regular at $\omega = -\pi/2$. When $e$ is a
-compile-time zero, Kepler's equation is skipped; when it is traced, the
-eccentric solution is always used, so that $\partial F/\partial e$ is
-correct at $e=0$.
+compile-time zero, the model skips Kepler's equation entirely; when it is
+traced, it always uses the eccentric solution, so that
+$\partial F/\partial e$ stays correct at $e=0$.
 
 \subsection{Derivatives and the CPU path} \label{sec:dispatch}
 
@@ -311,19 +311,19 @@ On a single CPU core, padding every point to the most complex geometry
 costs about an order of magnitude relative to the C++. The public
 functions therefore choose an implementation per platform at compile
 time (\texttt{jax.lax.platform\_dependent}): the C++ on CPUs, and the
-fixed-work model elsewhere. To make this possible, we moved the C++ \jax\
-primitives to \jax's public foreign function interface, as the APIs they
-used have been removed from \jax. The C++ supplies only first
-derivatives, so its Jacobian is given its own derivative rule, the
-fixed-work model's Hessian-vector product. That rule is traced only for
-second and higher derivatives: compiled first-order programs contain no
+fixed-work model everywhere else. To make this possible, I moved the C++
+\jax\ primitives to \jax's public foreign function interface, as \jax\ has
+since removed the APIs they used. The C++ supplies only first
+derivatives, so I give its Jacobian its own derivative rule, the
+fixed-work model's Hessian-vector product. \jax\ traces that rule only
+for second and higher derivatives: compiled first-order programs contain no
 fixed-work evaluations and keep the C++'s speed. The flux depends on time
 only through $t-t_0$, which gives the time derivatives on this path.
 
-Automatic differentiation gives exact derivatives of the implemented
-function. These approximate the model's derivatives to the accuracy of
-the quadrature and series above, and only where the topology is
-resolved. At a generic contact with a limb-darkened star, the occulted
+More fundamentally, automatic differentiation gives exact derivatives of
+the implemented function. These approximate the model's derivatives only
+to the accuracy of the quadrature and series above, and only where the
+topology is resolved. At a generic contact with a limb-darkened star, the occulted
 flux grows locally as $\delta^{3/2}$ in the penetration depth $\delta$,
 so the model's second derivatives are themselves singular there, and
 finite derivatives assigned at contact or tangency (e.g.\ the
@@ -331,23 +331,23 @@ $|f_\theta|$ guard) do not make it smooth.
 
 \section{Validation} \label{sec:validation}
 
-All tests use double precision, which the model requires. Agreement with
-the C++ alone cannot establish correctness (Section~\ref{sec:issues}),
-so we lead with independent references.
+All of my tests use double precision, which the model requires.
+Agreement with the C++ alone cannot establish correctness
+(Section~\ref{sec:issues}), so I lead with independent references.
 \begin{itemize}
 \item \textit{Overlap areas.} For a uniform star, $1-F$ is the overlap
-area over $\pi$, which we integrate independently in closed form along
+area over $\pi$, which I integrate independently, in closed form along
 rays from the planet's centre. Over 6000 random positive-radius shapes,
 $N_c=1$--4, $a_0 = 0.2$--1.2 and $d$ anywhere, including planets that
 cover the stellar centre and multi-lobed overlaps, the largest
 differences are ${\sim}10^{-7}$; these come from the reference itself,
-and fall to ${\sim}10^{-10}$ when its resolution is raised from
+and fall to ${\sim}10^{-10}$ when I raise its resolution from
 $2\times10^5$ to $8\times10^6$ rays.
 \item \textit{Analytic cases.} The shape $r_\mathrm{p} = 1 + a\cos\theta
 - a\cos^2\theta$ centred on the star has crossings at $\pm\pi/2$ and a
 tangency at $\theta=0$, and
-$F = a/2 + 2a/\pi - 7a^2/16 - 4a^2/(3\pi)$; we agree to $10^{-15}$. We
-also reproduce a tangency coexisting with crossings,
+$F = a/2 + 2a/\pi - 7a^2/16 - 4a^2/(3\pi)$, which the model reproduces
+to $10^{-15}$. It also reproduces a tangency coexisting with crossings,
 $r_\mathrm{p} = 0.125 - 0.00390625\cos 6\theta$ at $d=1.12109375$
 ($F = 0.999999975014641$), and nearby four-crossing cases.
 \item \textit{C++ parity.} For $N_c = 0$--3, circular and eccentric
@@ -358,8 +358,8 @@ Power-2 agrees with an independent C++ implementation of the law to
 $1.2\times10^{-10}$ for $N_c\leq2$.
 \item \textit{Derivatives.} Reverse- and forward-mode derivatives agree
 to $5\times10^{-14}$. They agree with the C++ analytic derivatives to
-$\leq10^{-5}$, the largest differences being just inside contact, where
-ours agree with converged finite differences to ${\sim}10^{-10}$
+$\leq10^{-5}$, with the largest differences just inside contact, where
+mine agree with converged finite differences to ${\sim}10^{-10}$
 (Section~\ref{sec:issues}). Through the CPU path, the Hessian of a planet
 inside a uniform star is $-2$ as required, and partial-transit Hessians
 match the fixed-work model's to $5\times10^{-15}$.
@@ -393,12 +393,12 @@ integrand has a square-root endpoint.}
 
 \section{Performance} \label{sec:performance}
 
-The GPUs available to us were shared with other jobs, so all GPU timings
-here are conservative and indicative. Table~\ref{tab:timing} compares the
+I could only use GPUs that other jobs were also using, so all of the GPU
+timings here are conservative and only indicative. Table~\ref{tab:timing} compares the
 fixed-work model on an NVIDIA Quadro RTX~6000, which executes double
 precision at 1/32 of its single-precision rate, with the C++ on one CPU
 core. For $N_c=1$, the general model matches the speed of the earlier
-first-order-only implementation from which it was derived. A value and
+first-order-only implementation I derived it from. A value and
 gradient for 500 points at $N_c=3$ takes 2.9\,ms on the GPU, against
 14.4\,ms for the C++ primitive on the same node's CPU.
 
@@ -426,27 +426,28 @@ strings and 582 points at a 60\,s cadence, the C++ takes 19--20\,ms per
 light curve on one core. The fixed-work model takes 3.2--3.8\,ms on the
 RTX~6000, and on an NVIDIA V100, which has full-rate double precision,
 1.7\,ms for one light curve and 0.81\,ms each in batches of 3120: about
-24 CPU cores' worth. Large batches are evaluated in chunks of bounded
-memory. Their cross-validated ensemble fit of one wavelength bin
+24 CPU cores' worth. The model evaluates large batches in chunks of
+bounded memory. Their cross-validated ensemble fit of one wavelength bin
 ($26\times5000\times10\times12 \approx 1.6\times10^7$ light curves) thus
 needs ${\sim}85$ core-hours of C++ evaluations, or ${\sim}3.5$ hours on
-one shared V100. As their reported cost per bin is about two weeks on 40
-cores, most of it evidently lies outside the light-curve kernel.
+one shared V100. Since they report about two weeks on 40 cores per bin,
+most of that cost likely lies outside the light-curve kernel itself.
 
 \section{Issues found in the original implementation}
 \label{sec:issues}
 
-Validation turned up the following in the C++ and its \jax\ interface,
-which v2's fixed-work model avoids. We have not changed the C++.
+Validation turned up the following problems in the C++ and its \jax\
+interface, all of which v2's fixed-work model avoids. I have not changed
+the C++ itself.
 \begin{enumerate}
 \item For planets that cover the stellar centre, a stellar arc crossing
 the far side of the star loses $2\pi$ in its principal angle difference,
 so the occulted integral can be wrong by a whole star. Fluxes above unity
 result, e.g.\ $1.0003$ for an $a_0=1.5$ string whose true flux is
 $0.0003$.
-\item The half-angle conversion to the true anomaly is clamped to
-$\sin f=0$, $\cos f=-1$ when $1+\cos E\leq10^{-10}$, which flattens the
-orbit near apastron ($\partial\sin f/\partial M = 0$ instead of $-0.82$
+\item The half-angle conversion to the true anomaly clamps
+$\sin f=0$, $\cos f=-1$ whenever $1+\cos E\leq10^{-10}$, which flattens
+the orbit near apastron ($\partial\sin f/\partial M = 0$ instead of $-0.82$
 at $e=0.1$).
 \item The eccentric anomaly at transit uses the half-angle form, whose
 derivatives with respect to $\omega$ are wrong near $\omega=-\pi/2$.
@@ -455,30 +456,30 @@ derivatives with respect to $\omega$ are wrong near $\omega=-\pi/2$.
 \item The derivative of a circular planet's flux with respect to $a_0$
 is in error by ${\sim}2\times10^{-6}$ just inside the second contact.
 \item When an endpoint combination is absent from the segment lookup
-table, no segment type is recorded, which misaligns the types of the
-following segments (found by reading the code).
+table, the code records no segment type, which misaligns the types of
+the following segments (which I found by reading the code).
 \item The \jax\ interface does not import on \jax\ $\geq0.6$, and it
 broadcast each orbital and limb-darkening parameter to the times while
 the C++ reads only the first element, silently truncating per-time
-arrays. Both are fixed in v2.
+arrays. I fix both in v2.
 \end{enumerate}
 
 \section{Summary} \label{sec:summary}
 
 The changes in \harmonica\ v2 are algorithmic, not a new wrapper around
 the C++. Bracketing replaces eigenvalues for the intersections, the
-implicit-function theorem supplies their derivatives, the occulted region
-is assembled from the directions of the crossings, and the radial and
-orbital formulae are rewritten to avoid cancellation. Together these
-give every light-curve point the same static work, which XLA can compile
-for GPUs, batch and differentiate. The release supports any $N_c$, the
+implicit-function theorem supplies their derivatives, the directions of
+the crossings assemble the occulted region, and rewritten radial and
+orbital formulae avoid cancellation. Together, these give every
+light-curve point the same static work, which XLA can compile for GPUs,
+batch and differentiate. The release supports any $N_c$, the
 quadratic, non-linear and power-2 laws, and selects the C++ automatically
 on CPUs. The code is built on \jax\ \citep{jax2018}.
 
 \begin{acknowledgments}
-We thank D.\ Grant for developing \harmonica\ and making it public, and
-an anonymous colleague for a careful review that found several of the
-issues corrected here.
+I thank D.\ Grant for developing \harmonica\ and making it public, and a
+colleague for a careful review that found several of the issues I
+correct here.
 \end{acknowledgments}
 
 \software{\harmonica\ \citep{grant2023}, \jax\ \citep{jax2018},
