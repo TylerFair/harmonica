@@ -196,23 +196,35 @@ class TestJaxNative(unittest.TestCase):
         np.testing.assert_array_equal(fs, np.ones(4))
 
     def test_dispatch(self):
-        """ Test harmonica.jax uses the C++ on CPUs and pure jax elsewhere. """
+        """ Test harmonica.jax's backends.
+
+        The default uses pure jax everywhere; backend='auto' uses the C++
+        on CPUs and pure jax elsewhere.
+        """
         from harmonica.jax import harmonica_transit_quad_ld
         rs = jnp.asarray(self._random_string(2))
 
-        def flux(r):
+        def default(r):
             return harmonica_transit_quad_ld(
                 self.times, self.t0, self.period, self.a, self.inc, 0.1,
                 0.2, *self.quad_ld, r=r)
 
+        def flux(r):
+            return harmonica_transit_quad_ld(
+                self.times, self.t0, self.period, self.a, self.inc, 0.1,
+                0.2, *self.quad_ld, r=r, backend='auto')
+
         fs_native = self._jax(0.1, 0.2, self.quad_ld, rs, 'quadratic')
+        np.testing.assert_allclose(jax.jit(default)(rs), fs_native, rtol=0.,
+                                   atol=1.e-14)
         if jax.default_backend() == 'cpu':
             ht = HarmonicaTransit(times=self.times)
             ht.set_orbit(self.t0, self.period, self.a, self.inc, 0.1, 0.2)
             ht.set_stellar_limb_darkening(self.quad_ld)
             ht.set_planet_transmission_string(np.asarray(rs))
-            np.testing.assert_array_equal(jax.jit(flux)(rs),
-                                          ht.get_transit_light_curve())
+            np.testing.assert_allclose(jax.jit(flux)(rs),
+                                       ht.get_transit_light_curve(),
+                                       rtol=0., atol=1.e-15)
         else:
             np.testing.assert_allclose(jax.jit(flux)(rs), fs_native,
                                        rtol=0., atol=1.e-14)
@@ -337,7 +349,7 @@ class TestJaxNative(unittest.TestCase):
         def flux(a0):
             return harmonica_transit_quad_ld(
                 jnp.array([5.]), 5., 10., 10., np.pi / 2., u1=0., u2=0.,
-                r=jnp.array([a0]))[0]
+                r=jnp.array([a0]), backend='auto')[0]
         # A uniform star wholly covering the planet: F = 1 - a0^2.
         self.assertAlmostEqual(float(jax.grad(jax.grad(flux))(0.1)), -2.,
                                places=12)
@@ -347,7 +359,7 @@ class TestJaxNative(unittest.TestCase):
         def dispatched(q):
             return harmonica_transit_quad_ld(
                 times, 5., 10., 10., 1.55, u1=q[1], u2=0.2,
-                r=jnp.array([q[0], 0.002, -0.001]))
+                r=jnp.array([q[0], 0.002, -0.001]), backend='auto')
 
         def pure(q):
             return native.harmonica_transit_quad_ld(
@@ -362,11 +374,39 @@ class TestJaxNative(unittest.TestCase):
         np.testing.assert_allclose(
             jnp.diagonal(jax.jacfwd(lambda t: harmonica_transit_quad_ld(
                 t, 5., 10., 10., 1.55, u1=0.3, u2=0.2,
-                r=jnp.array([0.1, 0.002, -0.001])))(times)),
+                r=jnp.array([0.1, 0.002, -0.001]), backend='auto'))(times)),
             jnp.diagonal(jax.jacfwd(lambda t: native.harmonica_transit_quad_ld(
                 t, 5., 10., 10., 1.55, u1=0.3, u2=0.2,
                 r=jnp.array([0.1, 0.002, -0.001])))(times)),
             rtol=0., atol=1.e-6)
+
+    def test_dispatch_trailing_zeros(self):
+        """ Test strings whose final two coefficients are zero.
+
+        The C++ cannot evaluate them, so the CPU path must not pass them on.
+        """
+        from harmonica.jax import harmonica_transit_quad_ld
+        rs = jnp.array([0.1, 0.002, -0.001, 0., 0.])
+
+        def flux(r):
+            return harmonica_transit_quad_ld(
+                self.times, self.t0, self.period, self.a, self.inc,
+                u1=0.1, u2=0.5, r=r, backend='auto')
+        expected = native.harmonica_transit_quad_ld(
+            self.times, self.t0, self.period, self.a, self.inc,
+            u1=0.1, u2=0.5, r=rs)
+        np.testing.assert_allclose(flux(rs), expected, rtol=0., atol=1.e-14)
+        np.testing.assert_allclose(
+            jax.vmap(flux)(jnp.stack([rs, rs.at[3].set(0.001)]))[0],
+            expected, rtol=0., atol=1.e-14)
+
+        # Called directly, the C++ wrapper refuses such strings rather
+        # than crashing.
+        from harmonica.jax import custom_primitives
+        with self.assertRaises(ValueError):
+            custom_primitives.harmonica_transit_quad_ld(
+                self.times, self.t0, self.period, self.a, self.inc,
+                u1=0.1, u2=0.5, r=jnp.array([0.1, 0., 0.]))
 
     def test_batching(self):
         """ Test per-time parameters, nd times, jit and vmap. """
