@@ -7,6 +7,29 @@ from harmonica import HarmonicaTransit
 from harmonica.jax import native
 
 
+def _brute_force_area(d, nu, r, n=2000000):
+    """ Overlap of a unit disc with the planet, integrated radially. """
+    theta = np.linspace(-np.pi, np.pi, n, endpoint=False)
+    rp = np.full_like(theta, r[0])
+    for k in range(1, (len(r) - 1) // 2 + 1):
+        rp += r[2 * k - 1] * np.cos(k * theta) + r[2 * k] * np.sin(k * theta)
+    c = d * np.cos(theta - nu)
+    disc = c * c - d * d + 1.
+    root = np.sqrt(np.maximum(disc, 0.))
+    lo, hi = np.maximum(c - root, 0.), np.minimum(c + root, rp)
+    inside = (disc > 0.) & (hi > lo)
+    return np.sum(np.where(inside, 0.5 * (hi * hi - lo * lo), 0.)) * 2. * np.pi / n
+
+
+def _uniform_flux(d, nu, r):
+    """ Native flux of a uniform star at one sky position. """
+    zero = jnp.asarray(0.)
+    s = native._occulted_integrals('quadratic', (zero, zero), jnp.asarray(d),
+                                   jnp.asarray(1.), jnp.asarray(nu),
+                                   jnp.asarray(r, dtype=jnp.float64), 200)
+    return 1. - float(s[0]) / np.pi
+
+
 class TestJaxNative(unittest.TestCase):
     """ Test the pure-jax light curves against the C++ implementation. """
 
@@ -58,13 +81,26 @@ class TestJaxNative(unittest.TestCase):
                     self.assertTrue(np.all(np.isfinite(fs_jax)))
                     self.assertLess(np.max(np.abs(fs_jax - fs_cpp)), 1.e-9)
 
-    def test_large_planet_parity(self):
-        """ Test fluxes match the C++ when the planet covers the star. """
+    def test_large_planet(self):
+        """ Test planets larger than the star against brute-force areas.
+
+        The C++ is not used as a reference here: when the planet covers
+        the stellar centre, some of its stellar arcs take the wrong way
+        round the star, giving fluxes above one.
+        """
+        times = np.linspace(4.7, 5.3, 41)
+        orbit = [jnp.asarray(x) for x in
+                 (self.t0, self.period, self.a, self.inc, 0., 0.)]
+        d, _, nu = (np.asarray(x) for x in native._orbit(
+            jnp.asarray(times), *orbit, True))
         for n_c in range(3):
             rs = self._random_string(n_c, r0=1.5)
-            fs_cpp = self._cpp(0., 0., self.quad_ld, rs, 'quadratic')
-            fs_jax = self._jax(0., 0., self.quad_ld, rs, 'quadratic')
-            self.assertLess(np.max(np.abs(fs_jax - fs_cpp)), 1.e-9)
+            fs = native.harmonica_transit_quad_ld(
+                times, self.t0, self.period, self.a, self.inc, r=rs,
+                n_legendre=200)
+            brute = np.array([1. - _brute_force_area(d_i, nu_i, rs) / np.pi
+                              for d_i, nu_i in zip(d, nu)])
+            self.assertLess(np.max(np.abs(np.asarray(fs) - brute)), 1.e-8)
 
     def test_power2_reduces_to_quadratic(self):
         """ Test power-2 with alpha=2 equals quadratic u1=2c, u2=-c. """
@@ -187,6 +223,150 @@ class TestJaxNative(unittest.TestCase):
             self.times, self.t0, self.period, self.a, self.inc, 0.1, 0.2,
             *self.quad_ld, r=r))(rs)
         self.assertLess(np.max(np.abs(jac - jac_native)), 1.e-6)
+
+    def test_independent_occulted_areas(self):
+        """ Test uniform-star fluxes against brute-force overlap areas.
+
+        Includes planets covering the stellar centre, whose stellar arcs
+        cross the far side of the star, and multi-lobed overlaps.
+        """
+        rng = np.random.default_rng(11)
+        n_tested = 0
+        while n_tested < 60:
+            n_c = int(rng.integers(1, 5))
+            r = np.zeros(2 * n_c + 1)
+            r[0] = rng.uniform(0.2, 1.2)
+            r[1:] = rng.normal(0., 0.35 * r[0] / n_c, 2 * n_c)
+            theta = np.linspace(-np.pi, np.pi, 2001)
+            rp = np.full_like(theta, r[0])
+            for k in range(1, n_c + 1):
+                rp += r[2 * k - 1] * np.cos(k * theta) \
+                    + r[2 * k] * np.sin(k * theta)
+            if rp.min() < 0.02 * r[0]:
+                continue
+            d = rng.uniform(0., 1. + rp.max())
+            nu = rng.uniform(-np.pi, np.pi)
+            brute = 1. - _brute_force_area(d, nu, r) / np.pi
+            self.assertLess(abs(_uniform_flux(d, nu, r) - brute), 1.e-8)
+            n_tested += 1
+
+    def test_tangency_with_crossings(self):
+        """ Test a tangency alongside crossings, and a nearby four-root case.
+
+        Both from independent reviews of this implementation.
+        """
+        r = np.zeros(13)
+        r[0], r[11] = 0.125, -0.00390625
+        self.assertAlmostEqual(_uniform_flux(1.12109375, 0., r),
+                               0.999999975014641, places=13)
+        brute = 1. - _brute_force_area(1.12109376, 0., r) / np.pi
+        self.assertLess(abs(_uniform_flux(1.12109376, 0., r) - brute), 1.e-9)
+
+    def test_near_contact_first_order_shape(self):
+        """ Test a narrow N_c = 1 tip beyond the limb is not missed. """
+        r = np.array([0.520001, 0.48 * np.cos(np.pi / 128),
+                      0.48 * np.sin(np.pi / 128)])
+        thetas, _, count = native._intersections(
+            jnp.asarray(0.), jnp.asarray(0.), jnp.asarray(r))
+        self.assertEqual(int(count), 2)
+        np.testing.assert_allclose(np.asarray(thetas)[:2],
+                                   [0.0225024507994, 0.0265849344129],
+                                   atol=1.e-12)
+
+    def test_kepler(self):
+        """ Test the true anomaly near apastron and as e approaches 1. """
+        dsinf = jax.grad(lambda M: native._solve_kepler(M, 0.1)[0])(np.pi)
+        self.assertAlmostEqual(float(dsinf),
+                               -np.sqrt(1. - 0.01) / (1. + 0.1) ** 2,
+                               places=13)
+        sinf, cosf, _ = native._solve_kepler(jnp.asarray(1.e-10), 0.99999999)
+        np.testing.assert_allclose([sinf, cosf], [0.33507211, -0.94219249],
+                                   atol=1.e-8)
+        # A tiny negative anomaly keeps its sign.
+        sinf, cosf, _ = native._solve_kepler(jnp.asarray(-1.e-18),
+                                             1. - 1.e-12)
+        np.testing.assert_allclose([sinf, cosf], [-0.899216, 0.437505],
+                                   atol=1.e-6)
+
+        # d nu / d omega vanishes at mid-transit.
+        def nu(omega):
+            return native._orbit(jnp.asarray(5.), *(jnp.asarray(x) for x in (
+                5., 10., 10., 1.5, 0.1)), omega, False)[2]
+        self.assertLess(abs(float(jax.grad(nu)(-np.pi / 2.))), 1.e-12)
+
+    def test_power2_centre_derivatives(self):
+        """ Test second derivatives of the power-2 kernel near the centre.
+
+        With t = 1 - z^2, zeta = sum_j a_j t^(j-1) / k for k = alpha + 2,
+        where a_j = (-1)^(j+1) binom(k/2, j).
+        """
+        k = 3.
+
+        def zeta(t):
+            return native._power_zeta(k, jnp.sqrt(1. - t), 1. - t)
+
+        def exact_second_derivative(t):
+            a, total = k / 2., 0.
+            for j in range(1, 60):
+                if j >= 3:
+                    total += a * (j - 1) * (j - 2) * t ** (j - 3) / k
+                a = -a * (k / 2. - j) / (j + 1.)
+            return total
+        for t in (0., 1.e-7, 1.e-3, 0.005, 0.02):
+            self.assertAlmostEqual(float(jax.grad(jax.grad(zeta))(t)),
+                                   exact_second_derivative(t), places=10)
+
+    def test_no_crossing_derivatives(self):
+        """ Test derivatives are finite for planets wholly inside the star. """
+        def flux(x):
+            zero = jnp.asarray(0.)
+            s = native._occulted_integrals(
+                'quadratic', (zero, zero), x[0], jnp.asarray(1.), x[1],
+                x[2:], 50)
+            return 1. - s[0] / np.pi
+        x = jnp.array([0.1, 0., 0.1])
+        np.testing.assert_allclose(jax.grad(flux)(x), [0., 0., -0.2],
+                                   atol=1.e-14)
+        self.assertAlmostEqual(float(jax.hessian(flux)(x)[2, 2]), -2.,
+                               places=12)
+
+    def test_cpu_hessians(self):
+        """ Test second derivatives through harmonica.jax on any platform. """
+        from harmonica.jax import harmonica_transit_quad_ld
+
+        def flux(a0):
+            return harmonica_transit_quad_ld(
+                jnp.array([5.]), 5., 10., 10., np.pi / 2., u1=0., u2=0.,
+                r=jnp.array([a0]))[0]
+        # A uniform star wholly covering the planet: F = 1 - a0^2.
+        self.assertAlmostEqual(float(jax.grad(jax.grad(flux))(0.1)), -2.,
+                               places=12)
+
+        times = jnp.linspace(4.95, 5.05, 7)
+
+        def dispatched(q):
+            return harmonica_transit_quad_ld(
+                times, 5., 10., 10., 1.55, u1=q[1], u2=0.2,
+                r=jnp.array([q[0], 0.002, -0.001]))
+
+        def pure(q):
+            return native.harmonica_transit_quad_ld(
+                times, 5., 10., 10., 1.55, u1=q[1], u2=0.2,
+                r=jnp.array([q[0], 0.002, -0.001]))
+        q = jnp.array([0.1, 0.3])
+        np.testing.assert_allclose(
+            jax.hessian(lambda x: jnp.sum(dispatched(x)))(q),
+            jax.hessian(lambda x: jnp.sum(pure(x)))(q), rtol=0., atol=1.e-6)
+
+        # Time derivatives are supported too.
+        np.testing.assert_allclose(
+            jnp.diagonal(jax.jacfwd(lambda t: harmonica_transit_quad_ld(
+                t, 5., 10., 10., 1.55, u1=0.3, u2=0.2,
+                r=jnp.array([0.1, 0.002, -0.001])))(times)),
+            jnp.diagonal(jax.jacfwd(lambda t: native.harmonica_transit_quad_ld(
+                t, 5., 10., 10., 1.55, u1=0.3, u2=0.2,
+                r=jnp.array([0.1, 0.002, -0.001])))(times)),
+            rtol=0., atol=1.e-6)
 
     def test_batching(self):
         """ Test per-time parameters, nd times, jit and vmap. """

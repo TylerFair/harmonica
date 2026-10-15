@@ -3,8 +3,9 @@
 This module evaluates the same transit model as the C++ extension, for
 any number of transmission-string harmonics, without a custom call. It
 can therefore be jit-compiled for GPUs, vmapped over many light curves,
-and differentiated with jax.grad/jax.jacfwd to arbitrary order of
-composition.
+and differentiated with jax.grad/jax.jacfwd, including to higher order.
+Like the model itself, higher derivatives are singular at the contact
+points, where the occulted area grows as a power 3/2 of the penetration.
 
 The algorithm follows harmonica's Green's-theorem formulation, with
 three numerical choices suited to fixed-shape XLA programs:
@@ -15,6 +16,9 @@ three numerical choices suited to fixed-shape XLA programs:
   theorem. Circles use closed-form intersections, and for N_c = 1 a
   certified bracket of the two extrema resolves narrow root pairs near
   contact that a grid can miss.
+* The occulted region's boundary is assembled from the direction in
+  which the limbs cross, with planet arcs ordered by angle about the
+  planet and stellar arcs ordered by angle about the star.
 * Every planet-limb integral uses Gauss-Legendre quadrature, with closed
   forms on stellar-limb segments. The quadratic and non-linear radial
   kernels are written in cancellation-free form.
@@ -35,8 +39,6 @@ jax.config.update("jax_enable_x64", True)
 _PI = math.pi
 _TWOPI = 2. * math.pi
 
-# Matches the C++ intersection association tolerance.
-_INTERSECT_TOL = 1.e-7
 # Tolerance for the trivial (no intersection) configurations.
 _GEOMETRY_TOL = 1.e-12
 
@@ -87,7 +89,10 @@ def harmonica_transit_quad_ld(times, t0, period, a, inc, ecc=0., omega=0.,
     Notes
     -----
     Orbital and limb-darkening parameters may be scalars or arrays that
-    broadcast against times.
+    broadcast against times. To evaluate many light curves at once, e.g.
+    a batch of strings, prefer adding a leading array dimension (times of
+    shape (B, N) and r of shape (B, 1, 2N_c+1)) over jax.vmap: inputs are
+    then evaluated in chunks of bounded memory.
 
     Returns
     -------
@@ -174,12 +179,43 @@ def _compiled_light_curve(law, circular_only, n_legendre, times,
 
     (r, r_axis), *ld = (batched(r, r.shape[-1:]),
                         *(batched(u) for u in ld_params))
-    flux = jax.vmap(
-        lambda d_i, z_i, nu_i, r_i, *ld_i: _flux(
-            law, d_i, z_i, nu_i, r_i, ld_i, n_legendre),
-        in_axes=(0, 0, 0, r_axis) + tuple(axis for _, axis in ld),
-    )(d, z, nu, r, *(u for u, _ in ld))
-    return flux.reshape(shape)
+    axes = (0, 0, 0, r_axis) + tuple(axis for _, axis in ld)
+    args = (d, z, nu, r) + tuple(u for u, _ in ld)
+
+    def evaluate(*args):
+        return jax.vmap(
+            lambda d_i, z_i, nu_i, r_i, *ld_i: _flux(
+                law, d_i, z_i, nu_i, r_i, ld_i, n_legendre),
+            in_axes=axes)(*args)
+
+    # Each point holds temporaries for every padded segment and quadrature
+    # node. Evaluate many points in chunks, so memory stays bounded while
+    # each chunk is still large enough to occupy a GPU.
+    n_points = d.shape[0]
+    chunk = max(256, 2 ** 22 // (_max_roots(r.shape[-1]) * n_legendre))
+    if n_points <= chunk:
+        return evaluate(*args).reshape(shape)
+    n_chunks = -(-n_points // chunk)
+
+    def split(x, axis):
+        if axis is None:
+            return x
+        # Pad by repeating the last point, which is always a valid one.
+        x = jnp.concatenate([x, jnp.repeat(x[-1:], n_chunks * chunk
+                                           - n_points, axis=0)])
+        return x.reshape((n_chunks, chunk) + x.shape[1:])
+
+    chunked = [split(x, axis) for x, axis in zip(args, axes)]
+    mapped = [i for i, axis in enumerate(axes) if axis is not None]
+
+    def one_chunk(xs):
+        full = list(chunked)
+        for i, x in zip(mapped, xs):
+            full[i] = x
+        return evaluate(*full)
+
+    flux = lax.map(one_chunk, [chunked[i] for i in mapped])
+    return flux.reshape(-1)[:n_points].reshape(shape)
 
 
 # ============================================================
@@ -216,13 +252,15 @@ def _orbit(time, t0, period, a, inc, ecc, omega, circular_only):
     def eccentric(_):
         sin_omega = jnp.sin(omega)
         cos_omega = jnp.cos(omega)
-        some = jnp.sqrt(jnp.maximum(1. - ecc, 1.e-30))
-        sope = jnp.sqrt(1. + ecc)
-        E0 = 2. * jnp.arctan2(some * cos_omega, sope * (1. + sin_omega))
-        M0 = E0 - ecc * jnp.sin(E0)
+        # Eccentric anomaly at transit, where f = pi/2 - omega. Unlike the
+        # half-angle form, this is regular, with correct derivatives, at
+        # omega = -pi/2.
+        E0 = jnp.arctan2(jnp.sqrt((1. - ecc) * (1. + ecc)) * cos_omega,
+                         ecc + sin_omega)
+        M0 = (1. - ecc) * E0 + ecc * _e_minus_sin(E0)
         mean_anomaly = (time - t0 + M0 / n) * n
-        sinf, cosf = _solve_kepler(mean_anomaly, ecc)
-        r = a * (1. - ecc * ecc) / jnp.maximum(1. + ecc * cosf, 1.e-30)
+        sinf, cosf, one_minus_ecosE = _solve_kepler(mean_anomaly, ecc)
+        r = a * one_minus_ecosE
         return project(r, cosf * sin_omega + sinf * cos_omega,
                        cosf * cos_omega - sinf * sin_omega)
 
@@ -230,32 +268,74 @@ def _orbit(time, t0, period, a, inc, ecc, omega, circular_only):
 
 
 def _solve_kepler(M, ecc):
-    """ Solve Kepler's equation for sin(f), cos(f) by Newton's method.
-
-    The 0.85 e starter for e > 0.8 avoids convergence to the wrong
-    branch at high eccentricity, where starting at E = M fails.
-    """
-    MA = jnp.mod(M, _TWOPI)
-    MAsign = jnp.where(MA > _PI, -1., 1.)
-    MA = jnp.where(MA > _PI, _TWOPI - MA, MA)
-    at_endpoint = (MA < 1.e-12) | ((_PI - MA) < 1.e-12)
-    E0 = jnp.where((ecc > 0.8) & ~at_endpoint, MA + 0.85 * ecc, MA)
-
-    def newton_step(E, _):
-        return E - (E - ecc * jnp.sin(E) - MA) / (1. - ecc * jnp.cos(E)), None
-
-    E, _ = lax.scan(newton_step, E0, None, length=15)
+    """ sin(f), cos(f) and 1 - e cos(E) from the mean anomaly M. """
+    # Reduce to [-pi, pi] by a signed remainder, which keeps tiny negative
+    # anomalies, and solve on [0, pi]: the other half is its mirror image.
+    MA = M - _TWOPI * jnp.round(M / _TWOPI)
+    MAsign = jnp.where(MA < 0., -1., 1.)
+    E = _kepler_half(jnp.abs(MA), ecc)
+    # Half-angle forms of 1 - e cos E and cos E - e, which do not cancel
+    # as e approaches 1.
+    s = jnp.sin(0.5 * E)
     sinE = MAsign * jnp.sin(E)
-    cosE = jnp.cos(E)
+    denom = (1. - ecc) + 2. * ecc * s * s
+    sinf = jnp.sqrt((1. - ecc) * (1. + ecc)) * sinE / denom
+    cosf = ((1. - ecc) - 2. * s * s) / denom
+    return sinf, cosf, denom
 
-    # True anomaly from the half-angle formula.
-    denom = 1. + cosE
-    tanf2 = (jnp.sqrt((1. + ecc) / jnp.maximum(1. - ecc, 1.e-30))
-             * sinE / jnp.maximum(denom, 1.e-30))
-    inv = 1. / (1. + tanf2 * tanf2)
-    sinf = jnp.where(denom > 1.e-10, 2. * tanf2 * inv, 0.)
-    cosf = jnp.where(denom > 1.e-10, (1. - tanf2 * tanf2) * inv, -1.)
-    return sinf, cosf
+
+@jax.custom_jvp
+def _kepler_half(M, ecc):
+    """ Eccentric anomaly E in [0, pi] solving E - e sin E = M in [0, pi].
+
+    Newton's method, safeguarded by bisection on the bracket [0, pi], with
+    E - e sin E written as (1 - e) E + e (E - sin E) so that it does not
+    cancel near periastron as e approaches 1. Derivatives are given by
+    the implicit-function theorem, not through the iterations.
+    """
+    def g(E):
+        return (1. - ecc) * E + ecc * _e_minus_sin(E) - M
+
+    def dg(E):
+        s = jnp.sin(0.5 * E)
+        return (1. - ecc) + 2. * ecc * s * s
+
+    def step(_, state):
+        E, lo, hi = state
+        value = g(E)
+        lo = jnp.where(value < 0., E, lo)
+        hi = jnp.where(value > 0., E, hi)
+        newton = E - value / dg(E)
+        # Keep a converged iterate, even when it lies on the bracket.
+        inside = (newton >= lo) & (newton <= hi)
+        E = jnp.where(value == 0., E,
+                      jnp.where(inside, newton, 0.5 * (lo + hi)))
+        return E, lo, hi
+
+    E0 = jnp.clip(M + ecc * jnp.sin(M), 0., _PI)
+    E, _, _ = lax.fori_loop(0, 50, step, (E0, jnp.zeros_like(M),
+                                         jnp.full_like(M, _PI)))
+    return E
+
+
+@_kepler_half.defjvp
+def _kepler_half_jvp(primals, tangents):
+    M, ecc = primals
+    M_t, ecc_t = tangents
+    E = _kepler_half(M, ecc)
+    s = jnp.sin(0.5 * E)
+    dg = (1. - ecc) + 2. * ecc * s * s
+    return E, (M_t + jnp.sin(E) * ecc_t) / dg
+
+
+def _e_minus_sin(E):
+    """ E - sin E, by its series for |E| < 0.1 to avoid cancellation. """
+    small = jnp.abs(E) < 0.1
+    Es = jnp.where(small, E, 0.)
+    E2 = Es * Es
+    series = Es * E2 * (1. / 6. - E2 * (1. / 120. - E2 * (1. / 5040. - E2 * (
+        1. / 362880. - E2 * (1. / 39916800. - E2 / 6227020800.)))))
+    return jnp.where(small, series, E - jnp.sin(E))
 
 
 # ============================================================
@@ -323,20 +403,31 @@ def _bisect(func, lo, hi, steps=_ROOT_BISECT_STEPS, unroll=10):
 
 
 def _sign_change_brackets(nodes, values, size):
-    """ Up to size intervals [nodes_i, nodes_i+1] with a sign change. """
-    left, right = values[:-1], values[1:]
-    changes = (((left < 0.) & (right >= 0.))
-               | ((left > 0.) & (right <= 0.)))
+    """ Up to size intervals [nodes_i, nodes_i+1] with a sign change.
+
+    The nodes span a closed loop, from -pi to pi. A node at which the
+    function is exactly zero takes the sign of the preceding non-zero
+    node, so a crossing there is counted once, and a tangency, which
+    does not change sign, is not counted at all.
+    """
+    values = values.at[-1].set(values[0])
+    sign = jnp.sign(values)
+    i = jnp.arange(values.shape[0])
+    last = lax.cummax(jnp.where(sign != 0., i, -1))
+    last = jnp.where(last < 0, jnp.max(jnp.where(sign != 0., i, -1)), last)
+    sign = jnp.where(last < 0, 0., sign[jnp.maximum(last, 0)])
+    changes = sign[:-1] * sign[1:] < 0.
     idx = jnp.nonzero(changes, size=size, fill_value=0)[0]
-    count = jnp.minimum(jnp.sum(changes.astype(jnp.int32)), size)
+    # The count is not capped, so that callers can detect an overflow.
+    count = jnp.sum(changes.astype(jnp.int32))
     return nodes[idx], nodes[idx + 1], jnp.arange(size) < count, count
 
 
 def _grid_roots(d, nu, r, max_roots):
     """ Bracket intersections on a fixed grid and bisect each bracket.
 
-    For N_c >= 2 the grid is augmented with the bisected extrema of f, so
-    that a narrow root pair inside one grid interval is still bracketed.
+    The grid is augmented with the bisected extrema of f, so that a
+    narrow root pair inside one grid interval is still bracketed.
     """
     n_c = (r.shape[0] - 1) // 2
     grid = np.linspace(-_PI, _PI, max(128, 64 * n_c) + 1)
@@ -346,7 +437,7 @@ def _grid_roots(d, nu, r, max_roots):
     f_func = lambda theta: _intersection_f(
         *_geometry(theta, cos_nu, sin_nu, r), d)[0]
     nodes, grid = jnp.asarray(grid), jnp.asarray(grid)
-    if n_c >= 2:
+    if n_c >= 1:
         df_func = lambda theta: _intersection_f(
             *_geometry(theta, cos_nu, sin_nu, r), d)[1]
         lo, hi, valid, _ = _sign_change_brackets(grid, df_grid, max_roots)
@@ -453,34 +544,6 @@ def _intersections_jvp(primals, tangents):
                                    jnp.zeros_like(count))
 
 
-def _intersection_types(theta, d, nu, r):
-    """ T (1=T+, 0=T-) and sign of d(rp - rs)/dtheta (1=+, 0=-). """
-    rp, drp, cos_tmnu, sin_tmnu = _geometry(theta, jnp.cos(nu),
-                                            jnp.sin(nu), r)
-    dcos = d * cos_tmnu
-    dsin = d * sin_tmnu
-    disc = jnp.maximum(dcos * dcos - d * d + 1., 0.)
-    sqrt_disc = _safe_sqrt(disc)
-    # Always T+ when the planet centre is inside the stellar disc.
-    T = jnp.where((d <= 1.) | (jnp.abs(rp - dcos - sqrt_disc)
-                               < _INTERSECT_TOL), 1., 0.)
-    frac = jnp.where(disc > 0., dsin * dcos
-                     / jnp.where(disc > 0., sqrt_disc, 1.), 0.)
-    grad = drp + dsin + jnp.where(T > 0.5, frac, -frac)
-    return T, jnp.where(grad > 0., 1., 0.)
-
-
-def _is_star_segment(T_j, dT_j, T_jp1, dT_jp1):
-    """ The C++ characterise_intersection_pairs lookup table.
-
-    Combinations absent from the table default to planet segments.
-    """
-    return (((T_j > 0.5) & (T_jp1 > 0.5) & (dT_j > 0.5) & (dT_jp1 < 0.5))
-            | ((T_j < 0.5) & (T_jp1 < 0.5) & (dT_j < 0.5) & (dT_jp1 > 0.5))
-            | ((T_j > 0.5) & (T_jp1 < 0.5) & (dT_j > 0.5) & (dT_jp1 > 0.5))
-            | ((T_j < 0.5) & (T_jp1 > 0.5) & (dT_j < 0.5) & (dT_jp1 < 0.5)))
-
-
 # ============================================================
 # Limb-darkening laws.
 # ============================================================
@@ -535,18 +598,31 @@ def _planet_zetas(law, ld, zp, zp_sq):
 
 
 def _power_zeta(k, zp, zp_sq):
-    """ (1 - zp^k) / (k (1 - zp^2)) for real k > 0, stable to zp = 1. """
+    """ (1 - zp^k) / (k (1 - zp^2)) for real k > 0, stable to zp = 1.
+
+    With t = 1 - zp^2 and p = k / 2, this is (1 - (1 - t)^p) / (k t).
+    """
     t = 1. - zp_sq
+    p = 0.5 * k
+    # A Taylor series near the disc centre, whose low-order derivatives
+    # are accurate too. Keeping p t <= 0.1 bounds its truncation error
+    # by ~1e-21 for any exponent.
+    series = t < jnp.minimum(0.01, 0.1 / p)
     near = t < 0.5
-    # Near the disc centre, 1 - zp^k = -expm1(k/2 log1p(-t)).
-    t_near = jnp.where(near & (t > 1.e-8), t, 0.25)
-    zeta_near = -jnp.expm1(0.5 * k * jnp.log1p(-t_near)) / (k * t_near)
-    # Second-order series for the final 1e-8, accurate to 1e-16.
-    zeta_near = jnp.where(t > 1.e-8, zeta_near, 0.5 - (k - 2.) * t / 8.)
+    t_series = jnp.where(series, t, 0.)
+    term, total = p, p
+    for j in range(1, 12):
+        term = -term * (p - j) / (j + 1.) * t_series
+        total = total + term
+    zeta_series = total / k
+    # 1 - (1 - t)^p = -expm1(p log1p(-t)) further out.
+    t_near = jnp.where(near & ~series, t, 0.25)
+    zeta_near = -jnp.expm1(p * jnp.log1p(-t_near)) / (k * t_near)
     zp_far = jnp.where(near, 0.5, zp)
     t_far = jnp.where(near, 0.75, t)
     zeta_far = (1. - jnp.power(zp_far, k)) / (k * t_far)
-    return jnp.where(near, zeta_near, zeta_far)
+    return jnp.where(series, zeta_series,
+                     jnp.where(near, zeta_near, zeta_far))
 
 
 # ============================================================
@@ -576,15 +652,15 @@ def _planet_segment(law, ld, theta_j, theta_jp1, d, nu, r, roots, weights,
                                    for zeta in zetas])
 
 
-def _star_segment(law, ld, theta_j, theta_jp1, d, nu, r, active):
-    """ Closed-form s_n integrals along the stellar limb. """
-    theta = jnp.where(active, jnp.stack([theta_j, theta_jp1]), 0.)
-    rp, _, cos_tmnu, sin_tmnu = _geometry(theta, jnp.cos(nu), jnp.sin(nu),
-                                          r)
-    y = jnp.where(active, -rp * sin_tmnu, 0.)
-    x = jnp.where(active, -rp * cos_tmnu + d, 1.)
-    phi = jnp.arctan2(y, x)
-    return (phi[1] - phi[0]) * _star_zetas(law, ld)
+def _limb_phi(theta, d, nu, r, active):
+    """ Angle about the stellar centre of the planet-limb point theta.
+
+    Inactive entries may coincide with the stellar centre, where arctan2
+    has no derivative; they are replaced before it is called.
+    """
+    rp, _, cos_tmnu, sin_tmnu = _geometry(theta, jnp.cos(nu), jnp.sin(nu), r)
+    return jnp.arctan2(jnp.where(active, -rp * sin_tmnu, 0.),
+                       jnp.where(active, -rp * cos_tmnu + d, 1.))
 
 
 def _flux(law, d, z, nu, r, ld, n_legendre):
@@ -611,13 +687,16 @@ def _occulted_integrals(law, ld, d, z, nu, r, n_legendre):
 
     thetas, _, count = _intersections(d, nu, r)
     count = jnp.rint(count).astype(jnp.int32)
-    # Closed curves cross an even number of times. An odd count is an
-    # exact tangency, for which the no-root topology is the stable limit.
-    # A tolerance-classified trivial geometry may still have a root pair
-    # within tolerance of contact; it must integrate the entire limb.
-    has_roots = (count >= 2) & (count % 2 == 0) & ~trivial
+    # Tangencies are not counted, so a closed curve crosses an even number
+    # of times. An odd count, or more crossings than f can have, means the
+    # bracketing failed, and the flux is returned as NaN rather than as a
+    # plausible but wrong value. A tolerance-classified trivial geometry
+    # may still have a root pair within tolerance of contact; it must
+    # integrate the entire limb.
+    unresolved = (count % 2 == 1) | (count > max_roots)
+    has_roots = (count >= 2) & ~unresolved & ~trivial
 
-    # Segments [theta_j, theta_j+1], closed by theta_0 + 2 pi.
+    # Planet-limb segments [theta_j, theta_j+1], closed by theta_0 + 2 pi.
     slot = jnp.arange(max_roots)
     in_use = slot < count
     padded = jnp.where(in_use, thetas, thetas[0])
@@ -628,22 +707,31 @@ def _occulted_integrals(law, ld, d, z, nu, r, n_legendre):
     first = slot == 0
     starts = jnp.where(has_roots, padded, jnp.where(first, nu - _PI, 0.))
     ends = jnp.where(has_roots, ends, jnp.where(first, nu + _PI, 0.))
-    active = jnp.where(has_roots, in_use, first)
 
-    T_j, dT_j = _intersection_types(starts, d, nu, r)
-    T_jp1, dT_jp1 = _intersection_types(ends, d, nu, r)
-    is_star = _is_star_segment(T_j, dT_j, T_jp1, dT_jp1)
+    # The occulted region's boundary follows from the direction of each
+    # crossing. f < 0 inside the star, so the planet arc after a crossing
+    # bounds the region when f_theta < 0 there. Ordered instead by angle
+    # phi about the stellar centre, the stellar arc after a crossing bounds
+    # it when f_theta > 0, because the planet's inside function on the
+    # stellar limb has derivative f_theta at a crossing. Unlike a lookup
+    # of each crossing's type, this is unaffected by tangencies, and each
+    # stellar arc runs anticlockwise.
+    _, f_theta = _intersection_f(
+        *_geometry(padded, jnp.cos(nu), jnp.sin(nu), r), d)
+    planet_arc = jnp.where(has_roots, in_use & (f_theta < 0.), first)
+    phi = _limb_phi(padded, d, nu, r, in_use & has_roots)
+    order = jnp.argsort(jnp.where(in_use, phi, jnp.inf))
+    phi_start = phi[order]
+    phi_end = jnp.where(slot == count - 1, phi_start[0] + _TWOPI,
+                        jnp.roll(phi_start, -1))
+    star_arc = has_roots & in_use & (f_theta[order] > 0.)
+    star = jnp.where(star_arc, phi_end - phi_start, 0.)
 
-    def segment(theta_j, theta_jp1, is_active):
-        return (_planet_segment(law, ld, theta_j, theta_jp1, d, nu, r,
-                                gl_roots, gl_weights, is_active),
-                _star_segment(law, ld, theta_j, theta_jp1, d, nu, r,
-                              is_active))
-
-    planet, star = jax.vmap(segment)(starts, ends, active)
-    intersecting = jnp.sum(jnp.where(
-        active[:, None], jnp.where(is_star[:, None], star, planet), 0.),
-        axis=0)
+    planet = jax.vmap(lambda theta_j, theta_jp1, is_active: _planet_segment(
+        law, ld, theta_j, theta_jp1, d, nu, r, gl_roots, gl_weights,
+        is_active))(starts, ends, planet_arc)
+    intersecting = (jnp.sum(planet, axis=0)
+                    + jnp.sum(star) * _star_zetas(law, ld))
 
     entire_planet = planet[0]
     entire_star = _TWOPI * _star_zetas(law, ld)
@@ -658,6 +746,7 @@ def _occulted_integrals(law, ld, d, z, nu, r, n_legendre):
                             jnp.where(triv_beyond, zeros,
                                       jnp.where(has_roots, intersecting,
                                                 no_roots))))
+    s = jnp.where(unresolved & ~trivial, jnp.nan, s)
     return jnp.where(z > 0., s, zeros)
 
 
