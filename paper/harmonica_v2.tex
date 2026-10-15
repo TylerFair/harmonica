@@ -40,8 +40,9 @@ default quadrature order and to ${\sim}4\times10^{-15}$ at matched order,
 wherever the C++ is itself correct. Critically, this validation also
 uncovered several errors in the original implementation, including fluxes
 above unity for planets that cover the stellar centre and a flattened
-orbit near apastron. A dispatch layer runs the C++ on CPUs, now with
-correct higher derivatives, and the new model everywhere else.
+orbit near apastron. The new model is therefore the default on every
+platform, while an opt-in mode runs the faster but unchanged C++ on CPUs,
+now with correct higher derivatives.
 \end{abstract}
 
 \keywords{Exoplanet atmospheres (487) --- Transits (1711) ---
@@ -308,12 +309,17 @@ $\partial F/\partial e$ stays correct at $e=0$.
 \subsection{Derivatives and the CPU path} \label{sec:dispatch}
 
 On a single CPU core, padding every point to the most complex geometry
-costs about an order of magnitude relative to the C++. The public
-functions therefore choose an implementation per platform at compile
-time (\texttt{jax.lax.platform\_dependent}): the C++ on CPUs, and the
-fixed-work model everywhere else. To make this possible, I moved the C++
-\jax\ primitives to \jax's public foreign function interface, as \jax\ has
-since removed the APIs they used. The C++ supplies only first
+costs about an order of magnitude relative to the C++. Because the C++
+still contains the errors in Section~\ref{sec:issues}, however, the
+public functions use the fixed-work model on every platform by default.
+With \texttt{backend='auto'}, they instead choose an implementation per
+platform at compile time (\texttt{jax.lax.platform\_dependent}): the
+C++ on CPUs, and the fixed-work model everywhere else. To make this
+possible, I moved the C++ \jax\ primitives to \jax's public foreign
+function interface, as \jax\ has since removed the APIs they used. The
+C++ also crashes outright on strings whose final two coefficients are
+both zero, so the wrapper refuses those, and the \texttt{'auto'} mode
+sends them to the fixed-work model. The C++ supplies only first
 derivatives, so I give its Jacobian its own derivative rule, the
 fixed-work model's Hessian-vector product. \jax\ traces that rule only
 for second and higher derivatives: compiled first-order programs contain no
@@ -430,8 +436,10 @@ RTX~6000, and on an NVIDIA V100, which has full-rate double precision,
 bounded memory. Their cross-validated ensemble fit of one wavelength bin
 ($26\times5000\times10\times12 \approx 1.6\times10^7$ light curves) thus
 needs ${\sim}85$ core-hours of C++ evaluations, or ${\sim}3.5$ hours on
-one shared V100. Since they report about two weeks on 40 cores per bin,
-most of that cost likely lies outside the light-curve kernel itself.
+one shared V100. They report about two weeks on 40 cores per bin, which
+these kernel costs alone do not account for; they do not, however,
+establish where that time was spent. Only a matched, end-to-end
+comparison of complete fits could show the practical speedup.
 
 \section{Issues found in the original implementation}
 \label{sec:issues}
@@ -462,6 +470,9 @@ the following segments (which I found by reading the code).
 broadcast each orbital and limb-darkening parameter to the times while
 the C++ reads only the first element, silently truncating per-time
 arrays. I fix both in v2.
+\item The C++ crashes the Python process on strings whose final two
+coefficients are both zero, e.g.\ a zero-padded circle, rather than
+raising an error.
 \end{enumerate}
 
 \section{Summary} \label{sec:summary}
@@ -473,8 +484,11 @@ the crossings assemble the occulted region, and rewritten radial and
 orbital formulae avoid cancellation. Together, these give every
 light-curve point the same static work, which XLA can compile for GPUs,
 batch and differentiate. The release supports any $N_c$, the
-quadratic, non-linear and power-2 laws, and selects the C++ automatically
-on CPUs. The code is built on \jax\ \citep{jax2018}.
+quadratic, non-linear and power-2 laws, and can run the C++ on CPUs on
+request. The code is built on \jax\ \citep{jax2018}, and the scripts and
+saved outputs behind every number in Sections~\ref{sec:validation} and
+\ref{sec:performance} are in \texttt{paper/reproduce} on the
+\texttt{paper-v2} branch.
 
 \begin{acknowledgments}
 I thank D.\ Grant for developing \harmonica\ and making it public, and a
