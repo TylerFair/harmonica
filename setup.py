@@ -4,7 +4,7 @@ from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 ext_modules = [
     Pybind11Extension(
-        "harmonica/bindings",
+        "harmonica.bindings",
         [
              'harmonica/orbit/kepler.cpp',
              'harmonica/orbit/trajectories.cpp',
@@ -15,7 +15,7 @@ ext_modules = [
          ],
         include_dirs=["vendor/eigen", "vendor/pybind11"],
         language="c++",
-        extra_compile_args=["-O2", "-ffast-math"]
+        extra_compile_args=["-O2"]
     ),
 ]
 
