@@ -146,7 +146,13 @@ def harmonica_transit_power2_ld(times, t0, period, a, inc, ecc=0., omega=0.,
 
 def _light_curve(law, times, orbit_params, ld_params, r, n_legendre):
     """ Check inputs and evaluate the compiled light curve. """
-    r = jnp.asarray(r, dtype=jnp.float64)
+    # Copy array inputs. On CPUs jax may otherwise share a NumPy array's
+    # memory, and evaluation is asynchronous, so a caller modifying it
+    # after this returns could change the result.
+    times = jnp.array(times, dtype=jnp.float64)
+    orbit_params = [jnp.array(p, dtype=jnp.float64) for p in orbit_params]
+    ld_params = [jnp.array(u, dtype=jnp.float64) for u in ld_params]
+    r = jnp.array(r, dtype=jnp.float64)
     if r.ndim == 0 or r.shape[-1] % 2 != 1:
         raise ValueError('The transmission string r must have an odd length.')
     # A constant zero eccentricity skips Kepler's equation entirely. A

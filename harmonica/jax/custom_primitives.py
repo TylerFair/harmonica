@@ -191,6 +191,26 @@ def _primitive(target, times, *params):
     n_rs = len(params) - (8 if target == "jax_light_curve_quad_ld" else 10)
     times = jnp.asarray(times, dtype=jnp.float64)
     params = [jnp.asarray(p, dtype=jnp.float64) for p in params]
+    if n_rs > 1:
+        # The C++ crashes if the final two coefficients are both zero. Raise
+        # for known values; otherwise pass it a valid stand-in, and return
+        # NaN, so that the call can never take the process down.
+        # Like the C++, use the first element of broadcast parameters.
+        degenerate = ((jnp.ravel(params[-2])[0] == 0.)
+                      & (jnp.ravel(params[-1])[0] == 0.))
+        if not isinstance(degenerate, jax.core.Tracer) and bool(
+                jnp.any(degenerate)):
+            raise ValueError(
+                'The C++ model requires the final two coefficients of r not '
+                'both to be zero; use harmonica.jax.native, or drop them.')
+        params[-2] = jnp.where(degenerate, 1., params[-2])
+        f, df_dz = _call_cpp(target, times, n_rs, params)
+        return (jnp.where(degenerate, jnp.nan, f),
+                jnp.where(degenerate, jnp.nan, df_dz))
+    return _call_cpp(target, times, n_rs, params)
+
+
+def _call_cpp(target, times, n_rs, params):
     call = jax.ffi.ffi_call(
         target,
         (jax.ShapeDtypeStruct(times.shape, jnp.float64),
