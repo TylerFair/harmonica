@@ -1,0 +1,63 @@
+{
+ "table_2": [
+  {
+   "n_times": 1000,
+   "n_c": 1,
+   "cpp_1core_ms": 2.9977399855852127,
+   "native_ms": 2.050182968378067,
+   "native_value_grad_ms": 2.1991147194057703
+  },
+  {
+   "n_times": 1000,
+   "n_c": 2,
+   "cpp_1core_ms": 6.617504544556141,
+   "native_ms": 1.4905870892107487,
+   "native_value_grad_ms": 1.71825191937387
+  },
+  {
+   "n_times": 1000,
+   "n_c": 3,
+   "cpp_1core_ms": 11.24819591641426,
+   "native_ms": 1.6183947678655386,
+   "native_value_grad_ms": 2.262925496324897
+  },
+  {
+   "n_times": 10000,
+   "n_c": 1,
+   "cpp_1core_ms": 30.65672181546688,
+   "native_ms": 14.345987606793642,
+   "native_value_grad_ms": 14.932185970246792
+  },
+  {
+   "n_times": 10000,
+   "n_c": 2,
+   "cpp_1core_ms": 63.31689711660146,
+   "native_ms": 7.518462231382728,
+   "native_value_grad_ms": 8.954099658876657
+  },
+  {
+   "n_times": 10000,
+   "n_c": 3,
+   "cpp_1core_ms": 107.61084910482168,
+   "native_ms": 11.808338994160295,
+   "native_value_grad_ms": 14.546878775581717
+  }
+ ],
+ "order_six_wasp17_like": {
+  "cpp_1core_ms_per_curve": 26.752023827284575,
+  "native_batch_1_ms_per_curve": 1.3696751557290554,
+  "native_batch_26_ms_per_curve": 0.8447042720105785,
+  "native_batch_1560_ms_per_curve": 0.7267803815790476,
+  "native_batch_3120_ms_per_curve": 0.7235451221155623
+ },
+ "provenance": {
+  "harmonica_commit": "c6e8ad64adf5db1a31ed5ead58cd39337b0a5efd",
+  "harmonica_modified": false,
+  "jax": "0.6.2",
+  "devices": [
+   "cuda:0"
+  ],
+  "python": "3.10.4",
+  "host": "midway3-0281.rcc.local"
+ }
+}

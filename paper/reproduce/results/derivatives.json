@@ -1,0 +1,54 @@
+{
+ "forward_vs_reverse": 2.842170943040401e-14,
+ "circle_r0_near_contact": [
+  {
+   "index": 724,
+   "native_ad": -0.15009723369516564,
+   "cpp_analytic": -0.1500992313419149,
+   "finite_differences_h_1e-5_1e-6_1e-7": [
+    -0.1500972349077756,
+    -0.15009723375314366,
+    -0.15009723353109905
+   ]
+  },
+  {
+   "index": 725,
+   "native_ad": -0.1449532688226725,
+   "cpp_analytic": -0.14495531299794406,
+   "finite_differences_h_1e-5_1e-6_1e-7": [
+    -0.1449532693764688,
+    -0.14495326883245951,
+    -0.14495326883245951
+   ]
+  },
+  {
+   "index": 726,
+   "native_ad": -0.14049446013711409,
+   "cpp_analytic": -0.1404964820590619,
+   "finite_differences_h_1e-5_1e-6_1e-7": [
+    -0.14049446045438785,
+    -0.14049446012132094,
+    -0.140494460509899
+   ]
+  }
+ ],
+ "cpp_path_internal_circle_d2F": -2.0,
+ "cpp_path_hessian_vs_native": 5.329070518200751e-15,
+ "default_decc_at_0_vs_fd": 7.054440105420251e-09,
+ "dsinf_dM_apastron_e0.1": -0.8223036670302644,
+ "dsinf_dM_apastron_e0.1_exact": -0.8223036670302644,
+ "true_anomaly_e0.99999999_M1e-10": [
+  0.33507211106174306,
+  -0.9421924858481024
+ ],
+ "provenance": {
+  "harmonica_commit": "c6e8ad64adf5db1a31ed5ead58cd39337b0a5efd",
+  "harmonica_modified": false,
+  "jax": "0.6.2",
+  "devices": [
+   "TFRT_CPU_0"
+  ],
+  "python": "3.10.4",
+  "host": "midway3-0172.rcc.local"
+ }
+}

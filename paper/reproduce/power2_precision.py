@@ -24,7 +24,9 @@ def reference(t, k, m):
                 factor = 1
                 for j in range(m):
                     factor *= i - j
-                total += coeff * factor * t ** (i - m)
+                # Decimal rejects 0 ** 0, which is 1 here.
+                power = t ** (i - m) if i > m else Decimal(1)
+                total += coeff * factor * power
             coeff = coeff * (Decimal(i + 1) - k / 2) / Decimal(i + 2)
         return float(total)
 
