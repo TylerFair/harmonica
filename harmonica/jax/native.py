@@ -220,7 +220,9 @@ def _compiled_light_curve(law, circular_only, n_legendre, times,
             full[i] = x
         return evaluate(*full)
 
-    flux = lax.map(one_chunk, [chunked[i] for i in mapped])
+    # Checkpointing each chunk keeps reverse-mode derivatives bounded too:
+    # otherwise every chunk's intermediates are stored for the backward pass.
+    flux = lax.map(jax.checkpoint(one_chunk), [chunked[i] for i in mapped])
     return flux.reshape(-1)[:n_points].reshape(shape)
 
 
